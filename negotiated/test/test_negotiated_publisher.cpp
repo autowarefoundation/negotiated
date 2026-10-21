@@ -14,12 +14,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "rclcpp/rclcpp.hpp"
@@ -637,6 +640,82 @@ TEST_F(TestNegotiatedPublisher, successful_negotiation_callback)
 
   // And now let's ensure that the negotiated callback was called
   ASSERT_TRUE(negotiation_cb_called);
+}
+
+TEST_F(TestNegotiatedPublisher, readers_wait_while_negotiating)
+{
+  // A reader on another thread must not see the supported types while negotiate() is still
+  // running: it blocks until negotiate() returns, including its successful_negotiation_cb.
+  rclcpp::Publisher<negotiated_interfaces::msg::SupportedTypes>::SharedPtr dummy =
+    create_and_publish_foo_supported_types({"std_msgs/msg/Empty"}, {"a"});
+
+  std::shared_ptr<negotiated::NegotiatedPublisher> pub;
+  std::thread reader;
+  std::atomic<bool> reader_started{false};
+  std::atomic<bool> reader_finished{false};
+  bool reader_finished_during_negotiation = false;
+  std::shared_ptr<rclcpp::PublisherBase> reader_publisher;
+  std::map<std::string, negotiated::detail::SupportedTypeInfo> reader_supported_types;
+
+  // Join before the reader's captured state is destroyed.
+  struct ReaderJoiner
+  {
+    std::thread & thread;
+    ~ReaderJoiner()
+    {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  } reader_joiner{reader};
+
+  negotiated::NegotiatedPublisherOptions options;
+  options.successful_negotiation_cb =
+    [&](const negotiated_interfaces::msg::NegotiatedTopicsInfo & topics)
+    {
+      (void)topics;
+      if (reader.joinable()) {
+        return;
+      }
+      reader = std::thread(
+        [&]()
+        {
+          reader_started = true;
+          // Every reader must block until negotiate() returns.
+          pub->type_was_negotiated<EmptyT>();
+          reader_publisher = pub->get_publisher<EmptyT>();
+          reader_supported_types = pub->get_supported_types();
+          pub->publish<EmptyT>(std_msgs::msg::Empty());
+          reader_finished = true;
+        });
+
+      // Deterministically wait for the background thread to start executing
+      while (!reader_started) {
+        std::this_thread::yield();
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      reader_finished_during_negotiation = reader_finished;
+    };
+
+  pub = std::make_shared<negotiated::NegotiatedPublisher>(*node_, "foo", options);
+
+  pub->add_supported_type<EmptyT>(1.0, rclcpp::QoS(10));
+
+  pub->start();
+
+  auto negotiated_break_cb = [pub]() -> bool
+    {
+      return pub->type_was_negotiated<EmptyT>();
+    };
+  ASSERT_TRUE(spin_while_waiting(negotiated_break_cb));
+  ASSERT_TRUE(reader.joinable());
+  reader.join();
+
+  ASSERT_TRUE(reader_finished);
+  ASSERT_FALSE(reader_finished_during_negotiation);
+  ASSERT_NE(reader_publisher, nullptr);
+  ASSERT_EQ(reader_supported_types.at("std_msgs/msg/Empty+a").publisher, reader_publisher);
 }
 
 TEST_F(TestNegotiatedPublisher, negotiation_callback)

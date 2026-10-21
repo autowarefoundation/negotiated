@@ -129,6 +129,10 @@ Once it finds at least one combination that works, it creates the appropriate nu
 If negotiation has produced a solution that works on the network, one or more of the preferences that the user expressed via `add_supported_type` are now active.
 In order to find out which of the supported types is in use, the user can call `type_was_negotiated` with a template argument of the appropriate type.
 If that particular type was one of the ones chosen in negotiation, true will be returned.
+`get_publisher` returns the chosen `rclcpp::PublisherBase` itself (or `nullptr`), for callers that need its topic name or subscription counts.
+
+`type_was_negotiated`, `get_publisher`, `publish`, `get_supported_types` and `get_negotiated_topics_info` may be called from any thread; while a negotiation runs they wait for it to finish.
+The callbacks in `NegotiatedPublisherOptions` run while the `NegotiatedPublisher` holds its lock: they may call the `NegotiatedPublisher` themselves, but must not wait for another thread that does.
 
 The user can then use the overloaded `publish` calls to publish data to the given type.
 This is accomplished by creating a ROS 2 message as usual, then calling `publish` with the template argument corresponding to the type that was chosen.

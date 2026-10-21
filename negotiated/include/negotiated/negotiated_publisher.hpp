@@ -125,6 +125,8 @@ void default_update_downstream_cb(
 }  // namespace detail
 
 /// NegotiatedPublisherOptions allows the user to control some aspects of the NegotiatedPublisher.
+/// The callbacks run while the NegotiatedPublisher holds its lock: they may call the
+/// NegotiatedPublisher itself, but must not wait for another thread that does.
 struct NegotiatedPublisherOptions final
 {
   /// Whether to automatically cause a renegotiation when NegotiatedSubscriptions leave the graph.
@@ -156,7 +158,7 @@ struct NegotiatedPublisherOptions final
       size_t maximum_solutions)> negotiation_cb{detail::default_negotiation_callback};
 
   /// A callback that will be called to update the downstream NegotiatedSubscriptions (if there
-  /// are any.
+  /// are any).
   std::function<void(
       const std::map<std::string, detail::SupportedTypeInfo> &,
       const std::shared_ptr<std::map<detail::PublisherGid,
@@ -278,6 +280,7 @@ public:
     using ROSMessageType = typename rclcpp::TypeAdapter<typename T::MsgT>::ros_message_type;
     std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
     std::string key_name = detail::generate_key(ros_type_name, T::supported_type_name);
+    std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
     if (key_to_supported_types_.count(key_name) != 0) {
       throw std::invalid_argument("Cannot add duplicate key to supported types");
     }
@@ -320,6 +323,7 @@ public:
     using ROSMessageType = typename rclcpp::TypeAdapter<typename T::MsgT>::ros_message_type;
     std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
     std::string key_name = detail::generate_key(ros_type_name, T::supported_type_name);
+    std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
     if (key_to_supported_types_.count(key_name) == 0) {
       throw std::invalid_argument("Specified key does not exist");
     }
@@ -363,6 +367,7 @@ public:
     using ROSMessageType = typename rclcpp::TypeAdapter<MsgT>::ros_message_type;
     std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
     std::string key_name = detail::generate_key(ros_type_name, supported_type_name);
+    std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
     if (key_to_supported_types_.count(key_name) != 0) {
       throw std::invalid_argument("Cannot add duplicate key to supported types");
     }
@@ -402,6 +407,7 @@ public:
     using ROSMessageType = typename rclcpp::TypeAdapter<MsgT>::ros_message_type;
     std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
     std::string key_name = detail::generate_key(ros_type_name, supported_type_name);
+    std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
     if (key_to_supported_types_.count(key_name) == 0) {
       throw std::invalid_argument("Specified key does not exist");
     }
@@ -459,23 +465,37 @@ public:
    * \return Whether the particular type was chosen by negotiation.
    */
   template<typename T>
-  bool type_was_negotiated()
+  bool type_was_negotiated() const
+  {
+    return get_publisher<T>() != nullptr;
+  }
+
+  /// Get the publisher chosen by negotiation for a particular type.
+  /**
+   * The pointer is copied under the lock, so this may be called from any thread.  Fetch it per
+   * message: a retained pointer may outlive the negotiation that chose it.
+   *
+   * \return The publisher for the type, or nullptr if it was not chosen by negotiation.
+   */
+  template<typename T>
+  std::shared_ptr<rclcpp::PublisherBase> get_publisher() const
   {
     using ROSMessageType = typename rclcpp::TypeAdapter<typename T::MsgT>::ros_message_type;
     std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
     std::string key = detail::generate_key(ros_type_name, T::supported_type_name);
-    if (key_to_supported_types_.count(key) == 0) {
-      return 0;
+    std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
+    auto it = key_to_supported_types_.find(key);
+    if (it == key_to_supported_types_.end()) {
+      return nullptr;
     }
-
-    return key_to_supported_types_[key].publisher != nullptr;
+    return it->second.publisher;
   }
 
   /// Publish constref data to a chosen publisher.
   /**
    * This method allows the user to publish data using constref to a chosen publisher.
    * This will only succeed if a publisher of that particular type has been chosen by
-   * negotiation; call type_was_negotiated() first to determine this.
+   * negotiation.
    * If a publisher of that particular type was not chosen, this method returns without doing
    * any work.
    * If a publisher of that particular type was chosen, this method publishes the data as
@@ -486,16 +506,7 @@ public:
   template<typename T, typename MessageT>
   void publish(const MessageT & msg)
   {
-    using ROSMessageType = typename rclcpp::TypeAdapter<typename T::MsgT>::ros_message_type;
-    std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
-    std::string key = detail::generate_key(ros_type_name, T::supported_type_name);
-
-    if (key_to_supported_types_.count(key) == 0) {
-      RCLCPP_INFO(node_logging_->get_logger(), "Negotiation hasn't happened yet, skipping publish");
-      return;
-    }
-
-    std::shared_ptr<rclcpp::PublisherBase> publisher = key_to_supported_types_[key].publisher;
+    std::shared_ptr<rclcpp::PublisherBase> publisher = get_publisher<T>();
     if (publisher == nullptr) {
       RCLCPP_INFO(
         node_logging_->get_logger(),
@@ -511,7 +522,7 @@ public:
   /**
    * This method allows the user to publish data using constref to a chosen publisher.
    * This will only succeed if a publisher of that particular type has been chosen by
-   * negotiation; call type_was_negotiated() first to determine this.
+   * negotiation.
    * If a publisher of that particular type was not chosen, this method returns without doing
    * any work.
    * If a publisher of that particular type was chosen, this method publishes the data as
@@ -522,16 +533,7 @@ public:
   template<typename T, typename MessageT>
   void publish(std::unique_ptr<MessageT> msg)
   {
-    using ROSMessageType = typename rclcpp::TypeAdapter<typename T::MsgT>::ros_message_type;
-    std::string ros_type_name = rosidl_generator_traits::name<ROSMessageType>();
-    std::string key = detail::generate_key(ros_type_name, T::supported_type_name);
-
-    if (key_to_supported_types_.count(key) == 0) {
-      RCLCPP_INFO(node_logging_->get_logger(), "Negotiation hasn't happened yet, skipping publish");
-      return;
-    }
-
-    std::shared_ptr<rclcpp::PublisherBase> publisher = key_to_supported_types_[key].publisher;
+    std::shared_ptr<rclcpp::PublisherBase> publisher = get_publisher<T>();
     if (publisher == nullptr) {
       RCLCPP_INFO(
         node_logging_->get_logger(),
@@ -556,19 +558,19 @@ public:
    * add_compatible_publisher().  In particular, it does not contain any types from
    * upstream subscriptions.
    *
-   * \return A map between the keys and SupportedTypeInfo structures that
-   *         represent each of the supported types.
+   * \return A copy, taken under the lock, of the map between the keys and SupportedTypeInfo
+   *         structures that represent each of the supported types.
    */
-  const std::map<std::string, detail::SupportedTypeInfo> & get_supported_types() const;
+  std::map<std::string, detail::SupportedTypeInfo> get_supported_types() const;
 
   /// Get the list of topics supported by this NegotiatedPublisher and all NegotiatedSubscriptions.
   /**
    * This list may be empty if negotiation has not yet happened, or failed.
    *
-   * \return The list of negotiated topics supported by both this NegotiatedPublisher and
-   *         all connected NegotiatedSubscriptions.
+   * \return A copy, taken under the lock, of the list of negotiated topics supported by both
+   *         this NegotiatedPublisher and all connected NegotiatedSubscriptions.
    */
-  const negotiated_interfaces::msg::NegotiatedTopicsInfo & get_negotiated_topics_info() const;
+  negotiated_interfaces::msg::NegotiatedTopicsInfo get_negotiated_topics_info() const;
 
 private:
   /// The timer callback to use to keep an eye on the network graph.
@@ -612,6 +614,10 @@ private:
   /// The original options to this class provided by the user.
   NegotiatedPublisherOptions negotiated_pub_options_;
 
+  /// Protects the negotiation state below against readers on other threads.  Recursive because
+  /// negotiate() runs user callbacks that may call back into this class.
+  mutable std::recursive_mutex supported_types_mutex_;
+
   /// A map between unique type keys (as returned by detail::generate_key()) and SupportedTypeInfos.
   std::map<std::string, detail::SupportedTypeInfo> key_to_supported_types_;
 
@@ -628,10 +634,6 @@ private:
 
   /// The graph event used for checking for graph changes.
   rclcpp::Event::SharedPtr graph_event_;
-
-  /// The mutex to protect against concurrent modification of the
-  /// negotiated_subscription_type_gids map.
-  std::mutex negotiated_subscription_type_mutex_;
 
   /// A map between PublisherGids and the list of unique type keys (as returned by
   /// detail::generate_key()).  This is used to track which GIDs preferences have been met during

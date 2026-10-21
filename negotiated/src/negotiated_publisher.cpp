@@ -331,6 +331,7 @@ NegotiatedPublisher::NegotiatedPublisher(
 
 NegotiatedPublisher::~NegotiatedPublisher()
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   if (upstream_negotiated_subscriptions_.size() > 0) {
     negotiated_interfaces::msg::SupportedTypes downstream_types;
     for (const std::pair<std::string, detail::SupportedTypeInfo> & type : key_to_supported_types_) {
@@ -375,7 +376,7 @@ void NegotiatedPublisher::graph_change_timer_callback()
     negotiated_publisher_->get_topic_name() + std::string("/_supported_types"));
 
   // We need to hold the lock across this entire operation
-  std::lock_guard<std::mutex> lg(negotiated_subscription_type_mutex_);
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
 
   for (const rclcpp::TopicEndpointInfo & endpoint : endpoints) {
     if (endpoint.endpoint_type() != rclcpp::EndpointType::Publisher) {
@@ -447,6 +448,7 @@ std::shared_ptr<detail::UpstreamNegotiatedSubscriptionHandle>
 NegotiatedPublisher::add_upstream_negotiated_subscription(
   std::shared_ptr<negotiated::NegotiatedSubscription> subscription)
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   auto it = std::find_if(
     upstream_negotiated_subscriptions_.begin(),
     upstream_negotiated_subscriptions_.end(),
@@ -474,6 +476,7 @@ NegotiatedPublisher::add_upstream_negotiated_subscription(
 void NegotiatedPublisher::remove_upstream_negotiated_subscription(
   const detail::UpstreamNegotiatedSubscriptionHandle * const handle)
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   auto it = std::find_if(
     upstream_negotiated_subscriptions_.begin(),
     upstream_negotiated_subscriptions_.end(),
@@ -499,6 +502,8 @@ void NegotiatedPublisher::supported_types_cb(
     std::begin(msg_info.get_rmw_message_info().publisher_gid.data),
     std::end(msg_info.get_rmw_message_info().publisher_gid.data),
     std::begin(gid_key));
+
+  std::lock_guard<std::recursive_mutex> types_lg(supported_types_mutex_);
 
   negotiated_interfaces::msg::SupportedTypes downstream_types_to_add;
   negotiated_interfaces::msg::SupportedTypes downstream_types_to_remove;
@@ -561,7 +566,6 @@ void NegotiatedPublisher::supported_types_cb(
 
   // Only add a new subscription to the GID map if any of the keys matched.
   if (!key_list.empty()) {
-    std::lock_guard<std::mutex> lg(negotiated_subscription_type_mutex_);
     negotiated_subscription_type_gids_->emplace(gid_key, key_list);
   }
 
@@ -594,6 +598,7 @@ void NegotiatedPublisher::start()
 
 void NegotiatedPublisher::stop()
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   supported_types_sub_.reset();
   for (std::pair<const std::string,
     detail::SupportedTypeInfo> & supported_info : key_to_supported_types_)
@@ -607,6 +612,7 @@ void NegotiatedPublisher::stop()
 
 void NegotiatedPublisher::negotiate()
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   RCLCPP_INFO(node_logging_->get_logger(), "Negotiating");
 
   if (key_to_supported_types_.empty()) {
@@ -707,15 +713,17 @@ void NegotiatedPublisher::negotiate()
   negotiated_publisher_->publish(negotiated_topics_info_);
 }
 
-const std::map<std::string, detail::SupportedTypeInfo> &
+std::map<std::string, detail::SupportedTypeInfo>
 NegotiatedPublisher::get_supported_types() const
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   return key_to_supported_types_;
 }
 
-const negotiated_interfaces::msg::NegotiatedTopicsInfo &
+negotiated_interfaces::msg::NegotiatedTopicsInfo
 NegotiatedPublisher::get_negotiated_topics_info() const
 {
+  std::lock_guard<std::recursive_mutex> lg(supported_types_mutex_);
   return negotiated_topics_info_;
 }
 
